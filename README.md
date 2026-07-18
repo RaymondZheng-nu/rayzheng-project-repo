@@ -1,2 +1,9 @@
-# Super-Duper-Mega-Productivity-Shockinator-9000-Pro-Max-Ulra-Premium-Deluxe-TM
-So this is my repo for my productivity machine check out the code guys!!
+# Project Repo!!
+So this is my repo for all my projects and such
+
+
+DO NOT MAKE ANYTHING THAT I MAKE IT IS VERY DANGEROUS
+
+THIS REPO IS SOLELY FOR EDUCATIONAL PURPOSES
+
+
