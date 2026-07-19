@@ -1,6 +1,14 @@
-# Super Productivity Maximizer 9001 Pro Max Ultra TM
+# super productivity maximizer 9001 pro max ultra tm
 
-A project that you shouldnt make ever that should maximize my productivity
+a project that shocks you with a tens unit to try to maximize productivity - this is not a recommendation, its dangerous, and you should not make this
+
+## do not make this
+
+this wires a relay into the power switch leads of a tens unit and lets a laptop trigger it automatically based on what app is open - that means it can shock you unattended, with no human judgement in the loop, based on nothing but a window title match
+
+tens units carry real medical risk and contraindications (pacemakers/other implanted electronic devices, pregnancy, epilepsy, heart problems, and more) - automating one removes the safety of a person manually deciding when to trigger it
+
+no license is granted, this repo is for educational purposes only, and the author is not liable for any injury or other harm resulting from building or using this
 
 ## How it (hopefully)  works
 
