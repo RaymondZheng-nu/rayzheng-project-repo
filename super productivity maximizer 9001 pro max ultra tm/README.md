@@ -44,21 +44,3 @@ Laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> Relay --> TENS7000 pot switch
   separate from the 3 resistive wiper pins), wired in parallel with the
   existing switch so manual operation still works.
 
-## Setup steps
-
-1. `arduino-cli core install esp32:esp32`
-2. Edit WiFi credentials and app list in `esp32_shock_relay.ino`, flash it
-   to the ESP32.
-3. Note the IP address printed over Serial and update `ESP32_IP` in
-   `toggle_shock_monitor.py`.
-4. Run `python3 toggle_shock_monitor.py` to start monitoring; run it again
-   to stop.
-
-## Safety notes
-
-- Keep the TENS7000's intensity dial fixed at a manually-tested, low
-  level — the relay only touches the power switch leads, never the
-  stimulation output or intensity potentiometer itself.
-- The cooldown exists to prevent rapid repeated triggering.
-- Be mindful of triggering while doing anything where a sudden, unexpected
-  muscle response could be a problem (e.g. holding something hot/sharp).
