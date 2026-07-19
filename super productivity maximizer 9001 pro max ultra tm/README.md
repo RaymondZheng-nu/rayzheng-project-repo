@@ -1,10 +1,8 @@
 # Super Productivity Maximizer 9001 Pro Max Ultra TM
 
-A DIY productivity-enforcement device: the laptop watches your active window
-and tells an ESP32 to trigger a relay wired into a TENS7000 unit whenever
-you're caught in an "unproductive" app.
+A project that you shouldnt make ever that should maximize my productivity
 
-## How it works
+## How it (hopefully)  works
 
 ```
 Laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> Relay --> TENS7000 pot switch
