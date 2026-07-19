@@ -11,9 +11,17 @@ const char* password = "YOUR_PASSWORD";
 WebServer server(80);
 
 const char* unproductiveApps[] = {
-  "firefox",      // match against window class, lowercase
   "discord",
-  "steam"
+  "steam",
+  "among us",
+  "geometry dash",
+  "grand theft auto v enhanced",
+  "learn to fly 3",
+  "raft",
+  "stardew valley",
+  "totally accurate battle simulator",
+  "worldbox",
+  "sober"
 };
 const int numApps = sizeof(unproductiveApps) / sizeof(unproductiveApps[0]);
 
