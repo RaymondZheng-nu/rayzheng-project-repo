@@ -10,7 +10,7 @@ so this is my repo for all my projects and such, mostly stuff i make for social 
 
 ## do not make anything in this repo it is very dangerous
 
-this repo is solely for educational purposes
+this repo is solely for educational purposes, do not take the existance of this repo as an invitation to make the projects i make 
 
 ## license disclaimer
 
