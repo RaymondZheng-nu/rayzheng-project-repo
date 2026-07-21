@@ -4,7 +4,7 @@
 const char* ssid = "YOUR_WIFI";
 const char* password = "YOUR_PASSWORD";
 
-#define RELAY_PIN 26
+#define RELAY_PIN 26   // active-low relay module: LOW closes the relay, HIGH is idle/open
 #define SHOCK_DURATION_MS 200
 #define COOLDOWN_MS 30000   // don't re-shock same app for 30s
 
@@ -45,9 +45,9 @@ void handleWindow() {
     bool changedApp = (window != lastWindow);
     bool cooldownPassed = (now - lastShockTime) > COOLDOWN_MS;
     if (changedApp || cooldownPassed) {
-      digitalWrite(RELAY_PIN, HIGH);
-      delay(SHOCK_DURATION_MS);
       digitalWrite(RELAY_PIN, LOW);
+      delay(SHOCK_DURATION_MS);
+      digitalWrite(RELAY_PIN, HIGH);
       lastShockTime = now;
     }
   }
@@ -57,7 +57,7 @@ void handleWindow() {
 
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH);
 
   Serial.begin(115200);
   WiFi.begin(ssid, password);
