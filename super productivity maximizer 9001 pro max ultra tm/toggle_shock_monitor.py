@@ -26,7 +26,7 @@ def get_active_window_class():
 def run_monitor():
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
-    print(f"Monitoring started (pid {os.getpid()})")
+    print(f"Monitoring started pid {os.getpid()}")
     try:
         while True:
             window = get_active_window_class()
@@ -50,9 +50,9 @@ def toggle():
             pid = int(f.read().strip())
         try:
             os.kill(pid, signal.SIGTERM)
-            print(f"Monitoring stopped (killed pid {pid})")
+            print(f"Monitoring stopped killed pid {pid}")
         except ProcessLookupError:
-            print("Stale pidfile, cleaning up")
+            print("Stale pidfile cleaning up")
         os.remove(PIDFILE)
     else:
         pid = os.fork()
@@ -61,7 +61,7 @@ def toggle():
             run_monitor()
             sys.exit(0)
         else:
-            print(f"Monitoring started in background (pid {pid})")
+            print(f"Monitoring started in background pid {pid}")
 
 
 if __name__ == "__main__":
