@@ -13,7 +13,7 @@ no license is granted, this repo is for educational purposes only, and the autho
 ## how it hopefully works
 
 ```
-laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 pot switch
+laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relays --> TENS7000 battery + both pot switches
 ```
 
 1. the Python script on the laptop polls the currently active window via
@@ -21,20 +21,24 @@ laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 pot switch
    ESP32 over WiFi
 2. the ESP32 checks the window name against a hardcoded list of
    unproductive apps
-3. if it's a match, and the cooldown or app change conditions are met, the
-   ESP32 pulses a GPIO pin to close a 5V relay
-4. the relay is wired in parallel with the TENS7000's built in
-   potentiometer switch leads, so closing the relay mimics a manual click
-   of the power switch, triggering the unit
+3. once you've stayed on a match for `DWELL_BEFORE_SHOCK_MS`, the ESP32
+   pulses 3 GPIO pins together to close 3 relay channels, then
+   re-shocks every `SHOCK_REPEAT_MS` while you stay on it
+4. two channels are wired in parallel with the TENS7000's two pot
+   switches (one per channel), so closing them mimics turning the knobs
+   on, manual operation still works too
+5. a third channel is spliced into the TENS7000's battery line instead,
+   so the unit is fully unpowered at idle even if both pot knobs are
+   left turned up (letting you pre-set intensity) - the pots alone can't
+   turn it on, only the battery relay closing can
 
 ## files
 
 - **`esp32_shock_relay.ino`** Arduino sketch flashed to the ESP32,
   runs a small WiFi HTTP server with a `/window` endpoint, compares the
-  posted window name, lowercased, against the `unproductiveApps` list and
-  pulses `RELAY_PIN` if there's a match, subject to a cooldown so it
-  doesn't re trigger every poll tick while you're still on the same app,
-  edit `ssid`, `password`, and `unproductiveApps` before flashing
+  posted window name, lowercased, against the `unproductiveApps` list
+  and fires the relays if there's a dwell-time match, edit `ssid`,
+  `password`, and `unproductiveApps` before flashing
 
 - **`toggle_shock_monitor.py`** run this on the laptop to start or stop
   monitoring, first run forks a background process that polls the active
@@ -45,9 +49,18 @@ laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 pot switch
 
 ## hardware setup
 
-- ESP32 GPIO 26 --> relay module `IN`
-- relay `VCC`/`GND` --> ESP32 5V/GND, shared ground with ESP32 is required
-- relay `COM`/`NO` --> soldered onto the TENS7000 potentiometer's switch
-  leads, the two pins that toggle continuity when the knob is clicked,
-  separate from the 3 resistive wiper pins, wired in parallel with the
-  existing switch so manual operation still works
+uses a 4-channel relay module, all inputs tied to the same ESP32 GPIO
+signal per channel below, so all three fire in sync:
+
+- ESP32 GPIO 26 --> relay `IN1`, relay `COM1`/`NO1` --> pot A's switch
+  leads (the two pins that toggle continuity when the knob is clicked,
+  separate from the 3 resistive wiper pins)
+- ESP32 GPIO 26 --> relay `IN2` --> relay `COM2`/`NO2` --> pot B's
+  switch leads, same as above
+- ESP32 GPIO 27 --> relay `IN3` --> relay `COM3`/`NO3` --> spliced into
+  the TENS7000's battery positive lead
+- relay `VCC`/`GND` --> ESP32 5V/GND, shared ground with ESP32 is
+  required
+- your relay module's `NO`/`NC` silkscreen labels may not match actual
+  behavior, verify empirically per channel (idle state should be off)
+  before trusting the label

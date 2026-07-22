@@ -4,9 +4,11 @@
 const char* ssid = "YOUR_WIFI";
 const char* password = "YOUR_PASSWORD";
 
-#define RELAY_PIN 26   // active-low relay module: LOW closes the relay, HIGH is idle/open
-#define SHOCK_DURATION_MS 200
-#define COOLDOWN_MS 30000   // don't re-shock same app for 30s
+#define RELAY_PIN 26           // active-low relay module: LOW closes the relay, HIGH is idle
+#define BATTERY_RELAY_PIN 27
+#define SHOCK_DURATION_MS 4500 // shorter and repeat shocks don't reliably register (cold-boots the TENS unit each time)
+#define DWELL_BEFORE_SHOCK_MS 5000
+#define SHOCK_REPEAT_MS 5000
 
 WebServer server(80);
 
@@ -25,7 +27,8 @@ const char* unproductiveApps[] = {
 };
 const int numApps = sizeof(unproductiveApps) / sizeof(unproductiveApps[0]);
 
-unsigned long lastShockTime = 0;
+unsigned long lastShockTime = 0;      // 0 = no shock yet this streak
+unsigned long unproductiveSince = 0;  // 0 = not currently in an unproductive streak
 String lastWindow = "";
 
 void handleWindow() {
@@ -41,23 +44,36 @@ void handleWindow() {
   }
 
   unsigned long now = millis();
-  if (unproductive) {
-    bool changedApp = (window != lastWindow);
-    bool cooldownPassed = (now - lastShockTime) > COOLDOWN_MS;
-    if (changedApp || cooldownPassed) {
+
+  if (window != lastWindow) {
+    // app changed, restart the timers
+    unproductiveSince = unproductive ? now : 0;
+    lastShockTime = 0;
+    lastWindow = window;
+  }
+
+  if (unproductive && unproductiveSince != 0) {
+    bool readyForShock = (lastShockTime == 0)
+      ? (now - unproductiveSince) >= DWELL_BEFORE_SHOCK_MS
+      : (now - lastShockTime) >= SHOCK_REPEAT_MS;
+    if (readyForShock) {
       digitalWrite(RELAY_PIN, LOW);
+      digitalWrite(BATTERY_RELAY_PIN, LOW);
       delay(SHOCK_DURATION_MS);
       digitalWrite(RELAY_PIN, HIGH);
+      digitalWrite(BATTERY_RELAY_PIN, HIGH);
       lastShockTime = now;
     }
   }
-  lastWindow = window;
+
   server.send(200, "text/plain", "ok");
 }
 
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
+  pinMode(BATTERY_RELAY_PIN, OUTPUT);
+  digitalWrite(BATTERY_RELAY_PIN, HIGH);
 
   Serial.begin(115200);
   WiFi.begin(ssid, password);
