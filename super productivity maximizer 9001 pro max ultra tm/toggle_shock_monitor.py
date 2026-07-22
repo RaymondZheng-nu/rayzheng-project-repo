@@ -8,7 +8,7 @@ import time
 
 import requests
 
-ESP32_IP = "192.168.1.50"  # set to your ESP32's IP
+ESP32_IP = "192.168.1.159"  # set to your ESP32's IP
 PIDFILE = "/tmp/shock_monitor.pid"
 POLL_INTERVAL = 2
 
