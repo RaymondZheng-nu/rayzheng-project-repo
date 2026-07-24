@@ -13,7 +13,7 @@ no license is granted, this repo is for educational purposes only, and the autho
 ## how it hopefully works
 
 ```
-laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relays --> TENS7000 battery + both pot switches
+laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 battery lead
 ```
 
 1. the Python script on the laptop polls the currently active window via
@@ -22,15 +22,15 @@ laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relays --> TENS7000 battery + b
 2. the ESP32 checks the window name against a hardcoded list of
    unproductive apps
 3. once you've stayed on a match for `DWELL_BEFORE_SHOCK_MS`, the ESP32
-   pulses 3 GPIO pins together to close 3 relay channels, then
-   re-shocks every `SHOCK_REPEAT_MS` while you stay on it
-4. two channels are wired in parallel with the TENS7000's two pot
-   switches (one per channel), so closing them mimics turning the knobs
-   on, manual operation still works too
-5. a third channel is spliced into the TENS7000's battery line instead,
-   so the unit is fully unpowered at idle even if both pot knobs are
-   left turned up (letting you pre-set intensity) - the pots alone can't
-   turn it on, only the battery relay closing can
+   closes a single relay channel spliced into the TENS7000's battery
+   line, then re-shocks every `SHOCK_REPEAT_MS` while you stay on it
+4. before use, manually turn both TENS pot knobs on to your desired
+   intensity and leave them there - the relay is the only thing gating
+   power, so the unit stays fully unpowered at idle regardless of pot
+   position, and only the battery relay closing turns it on
+5. the sketch logs every step (received window, match/no match, dwell
+   timer progress, relay open/close) over serial at 115200 baud, useful
+   for confirming the whole chain end to end without guessing
 
 ## files
 
@@ -49,18 +49,16 @@ laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relays --> TENS7000 battery + b
 
 ## hardware setup
 
-uses a 4-channel relay module, all inputs tied to the same ESP32 GPIO
-signal per channel below, so all three fire in sync:
+only one relay channel is used:
 
-- ESP32 GPIO 26 --> relay `IN1`, relay `COM1`/`NO1` --> pot A's switch
-  leads (the two pins that toggle continuity when the knob is clicked,
-  separate from the 3 resistive wiper pins)
-- ESP32 GPIO 26 --> relay `IN2` --> relay `COM2`/`NO2` --> pot B's
-  switch leads, same as above
-- ESP32 GPIO 27 --> relay `IN3` --> relay `COM3`/`NO3` --> spliced into
+- ESP32 GPIO 26 --> relay `IN1`, relay `COM1`/`NO1` --> spliced into
   the TENS7000's battery positive lead
 - relay `VCC`/`GND` --> ESP32 5V/GND, shared ground with ESP32 is
   required
 - your relay module's `NO`/`NC` silkscreen labels may not match actual
-  behavior, verify empirically per channel (idle state should be off)
-  before trusting the label
+  behavior, verify empirically (idle state should be off) before
+  trusting the label
+- solder joints matter more than they seem like they should here, a
+  cold or under-wetted joint can pass a casual continuity check and
+  still fail under real load, reflow until the joint is a smooth shiny
+  fillet on both surfaces, not a dull blob sitting on top
