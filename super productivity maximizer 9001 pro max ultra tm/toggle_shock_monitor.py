@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import glob
 import json
 import os
 import signal
@@ -6,11 +7,19 @@ import subprocess
 import sys
 import time
 
-import requests
+import serial
 
-ESP32_IP = "192.168.1.159"  # set to your ESP32's IP
+SERIAL_PORT = "/dev/ttyUSB0"  # set to your ESP32's serial port
+BAUD_RATE = 115200
 PIDFILE = "/tmp/shock_monitor.pid"
 POLL_INTERVAL = 2
+
+
+def find_serial_port():
+    if os.path.exists(SERIAL_PORT):
+        return SERIAL_PORT
+    candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+    return candidates[0] if candidates else None
 
 
 def get_active_window_class():
@@ -27,19 +36,32 @@ def run_monitor():
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     print(f"Monitoring started pid {os.getpid()}")
+
+    port = find_serial_port()
+    ser = serial.Serial(port, BAUD_RATE, timeout=1) if port else None
+    if ser is None:
+        print("No ESP32 serial port found, will keep retrying")
+
     try:
         while True:
+            if ser is None or not ser.is_open:
+                port = find_serial_port()
+                if port:
+                    try:
+                        ser = serial.Serial(port, BAUD_RATE, timeout=1)
+                    except serial.SerialException:
+                        ser = None
+
             window = get_active_window_class()
-            try:
-                requests.post(
-                    f"http://{ESP32_IP}/window",
-                    data=window,
-                    timeout=1,
-                )
-            except requests.RequestException:
-                pass  # ESP32 unreachable, skip this tick
+            if ser is not None:
+                try:
+                    ser.write((window + "\n").encode())
+                except serial.SerialException:
+                    ser = None  # ESP32 unplugged, retry next tick
             time.sleep(POLL_INTERVAL)
     finally:
+        if ser is not None:
+            ser.close()
         if os.path.exists(PIDFILE):
             os.remove(PIDFILE)
 

@@ -1,15 +1,7 @@
-#include <WiFi.h>
-#include <WebServer.h>
-
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
-
 #define BATTERY_RELAY_PIN 26    // active-low relay module: LOW closes the relay, HIGH is idle
 #define SHOCK_DURATION_MS 4500 // shorter and repeat shocks don't reliably register (cold-boots the TENS unit each time)
 #define DWELL_BEFORE_SHOCK_MS 5000
 #define SHOCK_REPEAT_MS 5000
-
-WebServer server(80);
 
 const char* unproductiveApps[] = {
   "discord",
@@ -30,8 +22,7 @@ unsigned long lastShockTime = 0;      // 0 = no shock yet this streak
 unsigned long unproductiveSince = 0;  // 0 = not currently in an unproductive streak
 String lastWindow = "";
 
-void handleWindow() {
-  String window = server.arg("plain");
+void handleWindow(String window) {
   window.toLowerCase();
   Serial.print("[recv] window=\"");
   Serial.print(window);
@@ -81,8 +72,6 @@ void handleWindow() {
       lastShockTime = now;
     }
   }
-
-  server.send(200, "text/plain", "ok");
 }
 
 void setup() {
@@ -90,17 +79,15 @@ void setup() {
   digitalWrite(BATTERY_RELAY_PIN, HIGH);
 
   Serial.begin(115200);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println(WiFi.localIP());
-
-  server.on("/window", HTTP_POST, handleWindow);
-  server.begin();
+  Serial.println("[boot] ready, waiting for window names over serial");
 }
 
 void loop() {
-  server.handleClient();
+  if (Serial.available()) {
+    String window = Serial.readStringUntil('\n');
+    window.trim();
+    if (window.length() > 0) {
+      handleWindow(window);
+    }
+  }
 }
