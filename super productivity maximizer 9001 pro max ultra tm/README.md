@@ -13,12 +13,13 @@ no license is granted, this repo is for educational purposes only, and the autho
 ## how it hopefully works
 
 ```
-laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 battery lead
+laptop (Hyprland) --USB serial--> ESP32 --GPIO--> relay --> TENS7000 battery lead
 ```
 
 1. the Python script on the laptop polls the currently active window via
-   Hyprland's `hyprctl activewindow -j` and sends the window class to the
-   ESP32 over WiFi
+   Hyprland's `hyprctl activewindow -j` and writes the window class to the
+   ESP32 over USB serial, no WiFi or shared network needed, the laptop and
+   ESP32 just need to be physically plugged together
 2. the ESP32 checks the window name against a hardcoded list of
    unproductive apps
 3. once you've stayed on a match for `DWELL_BEFORE_SHOCK_MS`, the ESP32
@@ -34,18 +35,22 @@ laptop (Hyprland) --HTTP POST--> ESP32 --GPIO--> relay --> TENS7000 battery lead
 
 ## files
 
-- **`esp32_shock_relay.ino`** Arduino sketch flashed to the ESP32,
-  runs a small WiFi HTTP server with a `/window` endpoint, compares the
-  posted window name, lowercased, against the `unproductiveApps` list
-  and fires the relays if there's a dwell-time match, edit `ssid`,
-  `password`, and `unproductiveApps` before flashing
+- **`esp32_shock_relay.ino`** Arduino sketch flashed to the ESP32, reads
+  window names line by line over USB serial, compares each, lowercased,
+  against the `unproductiveApps` list and fires the relay if there's a
+  dwell-time match, edit `unproductiveApps` before flashing, also logs
+  every step (received window, match/no match, dwell timer progress,
+  relay open/close) over the same serial connection at 115200 baud
 
 - **`toggle_shock_monitor.py`** run this on the laptop to start or stop
   monitoring, first run forks a background process that polls the active
-  window every 2 seconds and POSTs it to the ESP32, running the script
-  again while monitoring is active kills that background process, uses a
-  PID file at `/tmp/shock_monitor.pid` to track state, set `ESP32_IP` to
-  match the ESP32's address, printed over Serial on boot
+  window every 2 seconds and writes it to the ESP32 over USB serial,
+  running the script again while monitoring is active kills that
+  background process, uses a PID file at `/tmp/shock_monitor.pid` to
+  track state, set `SERIAL_PORT` if the ESP32 doesn't enumerate as
+  `/dev/ttyUSB0` (it auto-falls back to scanning `/dev/ttyUSB*` /
+  `/dev/ttyACM*` and reconnects if the cable is unplugged and replugged),
+  requires `pyserial`
 
 ## hardware setup
 
