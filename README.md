@@ -7,6 +7,8 @@ so this is my repo for all my projects and such, mostly stuff i make for social 
 | project | description |
 | --- | --- |
 | [super productivity maximizer 9001 pro max ultra tm](./super%20productivity%20maximizer%209001%20pro%20max%20ultra%20tm) | a diy device that shocks you with a tens unit when you open an unproductive app, physically dangerous see its readme |
+| [spiralos](./spiralos) | a nixos spin for engineers and makers, built on real nixos/nixpkgs with curated stack profiles, hardware-access fixes for dev boards, an installer, and a first-boot wizard |
+| [gl3](./gl3) | the spiralos wayland compositor, a dwm/i3-style tiling window manager built on wlroots |
 
 ## do not make anything in this repo it is very dangerous
 
