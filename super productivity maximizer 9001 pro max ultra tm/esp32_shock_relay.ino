@@ -1,5 +1,5 @@
-#define BATTERY_RELAY_PIN 26    // active-low relay module: LOW closes the relay, HIGH is idle
-#define SHOCK_DURATION_MS 4500 // shorter and repeat shocks don't reliably register (cold-boots the TENS unit each time)
+#define BATTERY_RELAY_PIN 26    // low closes the relay, high is idle
+#define SHOCK_DURATION_MS 4500 // shorter shocks stopped registering reliably
 #define DWELL_BEFORE_SHOCK_MS 5000
 #define SHOCK_REPEAT_MS 5000
 
@@ -18,8 +18,8 @@ const char* unproductiveApps[] = {
 };
 const int numApps = sizeof(unproductiveApps) / sizeof(unproductiveApps[0]);
 
-unsigned long lastShockTime = 0;      // 0 = no shock yet this streak
-unsigned long unproductiveSince = 0;  // 0 = not currently in an unproductive streak
+unsigned long lastShockTime = 0;      // 0 means no shock yet this streak
+unsigned long unproductiveSince = 0;  // 0 means not in an unproductive streak
 String lastWindow = "";
 
 void handleWindow(String window) {
@@ -44,7 +44,7 @@ void handleWindow(String window) {
   unsigned long now = millis();
 
   if (window != lastWindow) {
-    // app changed, restart the timers
+    // app changed, so reset the timers
     unproductiveSince = unproductive ? now : 0;
     lastShockTime = 0;
     lastWindow = window;
@@ -62,8 +62,7 @@ void handleWindow(String window) {
     Serial.print("ms ready=");
     Serial.println(readyForShock ? "yes" : "no");
     if (readyForShock) {
-      // pot knobs are manually pre-set to "on" + desired intensity; the battery
-      // relay alone gates whether the unit is powered at all
+      // pot knobs are pre-set by hand, the relay is what turns power on
       Serial.println("[relay] closing battery relay");
       digitalWrite(BATTERY_RELAY_PIN, LOW);   // power on
       delay(SHOCK_DURATION_MS);
