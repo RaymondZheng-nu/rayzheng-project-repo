@@ -25,6 +25,7 @@ with lib;
       tmux
       htop
       direnv
+      spiralos-rebuild
     ];
 
     programs.direnv.enable = true;

@@ -46,6 +46,9 @@
 
         spiralos-installer =
           (import nixpkgs { inherit system; overlays = [ overlay ]; }).spiralos-installer;
+
+        spiralos-rebuild =
+          (import nixpkgs { inherit system; overlays = [ overlay ]; }).spiralos-rebuild;
       };
     };
 }

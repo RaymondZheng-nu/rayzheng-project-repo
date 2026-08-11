@@ -25,7 +25,7 @@ two halves to the identity:
 - `overlays/` — package overlay for spiralos-specific packages/patches.
 - `iso/configuration.nix` — live-iso specific config; runs `spiralos-installer` on tty1.
 - `modules/installer.nix` — bakes the flake source + disko's module into `/etc` and autolaunches the installer, live-iso only.
-- `pkgs/` — custom package derivations (`spiralos-wizard`, `spiralos-installer`, future `spiralos-rebuild`).
+- `pkgs/` — custom package derivations (`spiralos-wizard`, `spiralos-installer`, `spiralos-rebuild`).
 
 ## usage
 
@@ -67,7 +67,7 @@ sudo nixos-rebuild switch --flake .#live
 - [x] debian-installer-style installer (`spiralos-installer`) — keyboard/hostname/timezone/user/disk/software, then partitions + installs
 - [x] first-boot setup wizard (`spiralos-wizard`) — post-install profile reconfiguration, detects gpu/laptop
 - [ ] own wm/de as the flagship shell (the `gl3` compositor, integrates later)
-- [ ] `spiralos-rebuild` wrapper — better diff/rollback ux over `nixos-rebuild`
+- [x] `spiralos-rebuild` wrapper — better diff/rollback ux over `nixos-rebuild`
 - [ ] graphical installer (current one is tty/whiptail, like `d-i`'s text frontend)
 - [ ] binary cache (cachix) for custom overlay packages
 - [ ] branding: boot splash, wallpaper, motd, prompt defaults
@@ -107,3 +107,16 @@ before login on a freshly installed system (see `modules/wizard.nix`). it:
 4. offers to run `nixos-rebuild switch` immediately.
 
 re-run it anytime with `spiralos-wizard --force`.
+
+## rebuild wrapper
+
+`spiralos-rebuild` wraps `nixos-rebuild` so you see what a switch will
+actually change before it happens, and so rollback is one word instead of
+a flag you have to remember:
+
+- `spiralos-rebuild diff` — build the new system, show the closure diff, don't switch
+- `spiralos-rebuild switch` — build, show the diff, then switch (default)
+- `spiralos-rebuild boot` / `spiralos-rebuild test` — same, but only set as boot default or activate without setting it
+- `spiralos-rebuild rollback` — boot into the previous generation
+
+it's installed by default on every spiralos system.
