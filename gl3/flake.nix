@@ -19,6 +19,7 @@
         libxkbcommon
         pixman
         udev
+        libjpeg
       ];
     in {
       packages.${system}.default = pkgs.stdenv.mkDerivation {
@@ -27,9 +28,11 @@
         src = ./.;
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = deps;
+        makeFlags = [ "DATADIR=${placeholder "out"}/share/gl3" ];
         installPhase = ''
           runHook preInstall
           install -Dm755 gl3 $out/bin/gl3
+          install -Dm644 assets/background.jpg $out/share/gl3/background.jpg
           runHook postInstall
         '';
         meta.description = "The SpiralOS Wayland compositor";

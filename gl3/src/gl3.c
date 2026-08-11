@@ -1,13 +1,18 @@
 #include <assert.h>
 #include <getopt.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+/* jpeglib.h needs stdio.h's FILE and stddef.h's size_t already defined */
+#include <jpeglib.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
@@ -26,16 +31,19 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
-/* --- gl3 configuration ------------------------------------------------
- * the spiralos compositor. super is the "spiral" modifier; the layout is a
- * dwm-style master/stack tiling. pierce the heavens. */
+/* gl3 config, super is the modifier key, layout is dwm-style master/stack */
 #define GL3_TERMINAL "foot"
 #define GL3_GAP 8
-#define GL3_MASTER_RATIO 6 /* master column takes ratio/10 of the width */
-/* deep gurren crimson desktop background (linear rgba). */
+#define GL3_MASTER_RATIO 6 /* starting ratio, super+h/l adjusts it at runtime */
+#define GL3_NUM_WORKSPACES 10 /* super+1-0 switches, super+shift+1-0 moves */
+/* deep gurren crimson desktop background, used if the wallpaper fails to load */
 static const float GL3_BG_COLOR[4] = { 0.16f, 0.02f, 0.03f, 1.0f };
+/* default wallpaper, DATADIR is set by the makefile at build time */
+#define GL3_BG_IMAGE GL3_DATADIR "/background.jpg"
+/* drm's xrgb8888 fourcc code, matches drm_fourcc.h's DRM_FORMAT_XRGB8888 */
+#define GL3_DRM_FORMAT_XRGB8888 0x34325258
 
-/* for brevity's sake, struct members are annotated where they are used. */
+/* struct members are commented where they are used, not here */
 enum gl3_cursor_mode {
 	GL3_CURSOR_PASSTHROUGH,
 	GL3_CURSOR_MOVE,
@@ -78,6 +86,9 @@ struct gl3_server {
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
 	struct wl_listener new_output;
+
+	int master_ratio;
+	int current_workspace;
 };
 
 struct gl3_output {
@@ -102,6 +113,7 @@ struct gl3_toplevel {
 	struct wl_listener request_resize;
 	struct wl_listener request_maximize;
 	struct wl_listener request_fullscreen;
+	int workspace;
 };
 
 struct gl3_popup {
@@ -120,8 +132,119 @@ struct gl3_keyboard {
 	struct wl_listener destroy;
 };
 
+/* lets us bail out of a broken jpeg instead of libjpeg calling exit() */
+struct gl3_jpeg_error {
+	struct jpeg_error_mgr pub;
+	jmp_buf jmp;
+};
+
+static void gl3_jpeg_error_exit(j_common_ptr cinfo) {
+	struct gl3_jpeg_error *err = (struct gl3_jpeg_error *)cinfo->err;
+	longjmp(err->jmp, 1);
+}
+
+/* loads a jpeg file and converts it to xrgb8888 pixels, or NULL on failure */
+static uint8_t *load_jpeg_xrgb(const char *path, int *out_w, int *out_h) {
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return NULL;
+	}
+
+	struct jpeg_decompress_struct cinfo;
+	struct gl3_jpeg_error jerr;
+	cinfo.err = jpeg_std_error(&jerr.pub);
+	jerr.pub.error_exit = gl3_jpeg_error_exit;
+
+	uint8_t *pixels = NULL;
+	uint8_t *row = NULL;
+	if (setjmp(jerr.jmp)) {
+		/* libjpeg hit an error partway through, clean up and give up */
+		jpeg_destroy_decompress(&cinfo);
+		free(pixels);
+		free(row);
+		fclose(f);
+		return NULL;
+	}
+
+	jpeg_create_decompress(&cinfo);
+	jpeg_stdio_src(&cinfo, f);
+	jpeg_read_header(&cinfo, TRUE);
+	cinfo.out_color_space = JCS_RGB;
+	jpeg_start_decompress(&cinfo);
+
+	int w = (int)cinfo.output_width;
+	int h = (int)cinfo.output_height;
+	pixels = malloc((size_t)w * h * 4);
+	row = malloc((size_t)w * 3);
+
+	/* libjpeg only gives us one rgb row at a time, we convert as we go */
+	while (cinfo.output_scanline < cinfo.output_height) {
+		int y = (int)cinfo.output_scanline;
+		JSAMPROW rows[1] = { row };
+		jpeg_read_scanlines(&cinfo, rows, 1);
+		uint8_t *dst = pixels + (size_t)y * w * 4;
+		for (int x = 0; x < w; x++) {
+			/* xrgb8888 stores bytes as b, g, r, x on little-endian */
+			dst[x * 4 + 0] = row[x * 3 + 2];
+			dst[x * 4 + 1] = row[x * 3 + 1];
+			dst[x * 4 + 2] = row[x * 3 + 0];
+			dst[x * 4 + 3] = 0xff;
+		}
+	}
+	free(row);
+
+	jpeg_finish_decompress(&cinfo);
+	jpeg_destroy_decompress(&cinfo);
+	fclose(f);
+
+	*out_w = w;
+	*out_h = h;
+	return pixels;
+}
+
+/* wraps decoded pixels so the wlroots scene graph knows how to render them */
+struct gl3_image_buffer {
+	struct wlr_buffer base;
+	uint8_t *pixels;
+	size_t stride;
+};
+
+static void gl3_image_buffer_destroy(struct wlr_buffer *buffer) {
+	struct gl3_image_buffer *buf = wl_container_of(buffer, buf, base);
+	free(buf->pixels);
+	free(buf);
+}
+
+static bool gl3_image_buffer_begin_data_ptr_access(struct wlr_buffer *buffer,
+		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
+	struct gl3_image_buffer *buf = wl_container_of(buffer, buf, base);
+	*data = buf->pixels;
+	*format = GL3_DRM_FORMAT_XRGB8888;
+	*stride = buf->stride;
+	return true;
+}
+
+static void gl3_image_buffer_end_data_ptr_access(struct wlr_buffer *buffer) {
+	/* pixels are plain memory, always readable, nothing to release */
+}
+
+static const struct wlr_buffer_impl gl3_image_buffer_impl = {
+	.destroy = gl3_image_buffer_destroy,
+	.begin_data_ptr_access = gl3_image_buffer_begin_data_ptr_access,
+	.end_data_ptr_access = gl3_image_buffer_end_data_ptr_access,
+};
+
+/* takes ownership of pixels, they get freed when the buffer is destroyed */
+static struct wlr_buffer *gl3_image_buffer_create(uint8_t *pixels, int w, int h) {
+	struct gl3_image_buffer *buf = calloc(1, sizeof(*buf));
+	buf->pixels = pixels;
+	buf->stride = (size_t)w * 4;
+	wlr_buffer_init(&buf->base, &gl3_image_buffer_impl, w, h);
+	return &buf->base;
+}
+
 static void focus_toplevel(struct gl3_toplevel *toplevel) {
-	/* note: this function only deals with keyboard focus. */
+	/* only handles keyboard focus, not pointer focus */
 	if (toplevel == NULL) {
 		return;
 	}
@@ -130,15 +253,11 @@ static void focus_toplevel(struct gl3_toplevel *toplevel) {
 	struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
 	struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
 	if (prev_surface == surface) {
-		/* don't re-focus an already focused surface. */
+		/* already focused, nothing to do */
 		return;
 	}
 	if (prev_surface) {
-		/*
-		 * deactivate the previously focused surface. this lets the client know
-		 * it no longer has focus and the client will repaint accordingly, e.g.
-		 * stop displaying a caret.
-		 */
+		/* tell the old surface it lost focus, so it can repaint */
 		struct wlr_xdg_toplevel *prev_toplevel =
 			wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
 		if (prev_toplevel != NULL) {
@@ -146,26 +265,20 @@ static void focus_toplevel(struct gl3_toplevel *toplevel) {
 		}
 	}
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-	/* raise the toplevel in the scene graph. under tiling this is harmless
-	 * (windows don't overlap); we deliberately do not reorder the toplevels
-	 * list on focus, so tiles keep a stable position. */
+	/* raise it in the scene graph, tiles don't overlap so this is harmless */
+	/* the toplevels list order is untouched, so tile positions stay put */
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
 	/* activate the new surface */
 	wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-	/*
-	 * tell the seat to have the keyboard enter this surface. wlroots will keep
-	 * track of this and automatically send key events to the appropriate
-	 * clients without additional work on your part.
-	 */
+	/* let the seat send key events to this surface from now on */
 	if (keyboard != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, surface,
 			keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
 	}
 }
 
-/* tile all mapped toplevels across the output layout in a dwm-style
- * master/stack layout: the list head is the master (left column), the rest
- * are stacked in the right column. called whenever the window set changes. */
+/* lays out windows dwm-style, first window is master, rest stack */
+/* only windows on the current workspace are shown, others get hidden */
 static void arrange(struct gl3_server *server) {
 	struct wlr_box area = {0};
 	wlr_output_layout_get_box(server->output_layout, NULL, &area);
@@ -173,30 +286,45 @@ static void arrange(struct gl3_server *server) {
 		return;
 	}
 
-	int n = wl_list_length(&server->toplevels);
+	int n = 0;
+	struct gl3_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		bool visible = toplevel->workspace == server->current_workspace;
+		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, visible);
+		if (visible) {
+			n++;
+		}
+	}
 	if (n == 0) {
 		return;
 	}
 
 	const int gap = GL3_GAP;
-	struct gl3_toplevel *toplevel;
 
 	if (n == 1) {
-		toplevel = wl_container_of(server->toplevels.next, toplevel, link);
-		wlr_scene_node_set_position(&toplevel->scene_tree->node,
-			area.x + gap, area.y + gap);
-		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
-			area.width - 2 * gap, area.height - 2 * gap);
-		return;
+		wl_list_for_each(toplevel, &server->toplevels, link) {
+			if (toplevel->workspace != server->current_workspace) {
+				continue;
+			}
+			wlr_scene_node_set_position(&toplevel->scene_tree->node,
+				area.x + gap, area.y + gap);
+			wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+				area.width - 2 * gap, area.height - 2 * gap);
+			return;
+		}
 	}
 
-	int master_w = (area.width - 3 * gap) * GL3_MASTER_RATIO / 10;
+	int master_w = (area.width - 3 * gap) * server->master_ratio / 10;
 	int stack_w = area.width - 3 * gap - master_w;
 	int stack_n = n - 1;
+	/* rounding here can leave the last stack window a few px short */
 	int stack_h = (area.height - (stack_n + 1) * gap) / stack_n;
 
 	int i = 0;
 	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->workspace != server->current_workspace) {
+			continue;
+		}
 		if (i == 0) {
 			wlr_scene_node_set_position(&toplevel->scene_tree->node,
 				area.x + gap, area.y + gap);
@@ -214,37 +342,95 @@ static void arrange(struct gl3_server *server) {
 	}
 }
 
-/* cycle keyboard focus to the next toplevel in the list, without disturbing
- * the tiling order. */
-static void focus_next(struct gl3_server *server) {
-	if (wl_list_length(&server->toplevels) < 2) {
-		return;
-	}
+/* finds the gl3_toplevel for the surface that currently has keyboard focus */
+static struct gl3_toplevel *focused_toplevel(struct gl3_server *server) {
 	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
-	struct gl3_toplevel *t, *current = NULL;
+	struct gl3_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
 		if (t->xdg_toplevel->base->surface == focused) {
-			current = t;
-			break;
+			return t;
 		}
 	}
-	struct wl_list *nl;
-	if (current == NULL) {
-		nl = server->toplevels.next;
-	} else {
-		nl = current->link.next;
-		if (nl == &server->toplevels) {
-			/* skip the list sentinel and wrap to the first real toplevel. */
-			nl = server->toplevels.next;
+	return NULL;
+}
+
+/* moves keyboard focus to the next window on the current workspace */
+static void focus_next(struct gl3_server *server) {
+	struct gl3_toplevel *current = focused_toplevel(server);
+	struct gl3_toplevel *first = NULL;
+	struct gl3_toplevel *next = NULL;
+	bool seen_current = false;
+	struct gl3_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->workspace != server->current_workspace) {
+			continue;
+		}
+		if (first == NULL) {
+			first = t;
+		}
+		if (seen_current && next == NULL) {
+			next = t;
+		}
+		if (t == current) {
+			seen_current = true;
 		}
 	}
-	struct gl3_toplevel *next = wl_container_of(nl, next, link);
+	if (next == NULL) {
+		/* wrapped around, or nothing was focused, go to the first window */
+		next = first;
+	}
 	focus_toplevel(next);
 }
 
-/* fork/exec a shell command detached from the compositor. sigchld is ignored
- * in main() so we don't accumulate zombies. */
+/* switches which workspace is shown, does nothing if already on it */
+static void switch_workspace(struct gl3_server *server, int ws) {
+	if (ws == server->current_workspace) {
+		return;
+	}
+	server->current_workspace = ws;
+	arrange(server);
+	/* focus the first window on the new workspace, or clear focus */
+	struct gl3_toplevel *t, *first = NULL;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->workspace == ws) {
+			first = t;
+			break;
+		}
+	}
+	if (first != NULL) {
+		focus_toplevel(first);
+	} else {
+		wlr_seat_keyboard_notify_clear_focus(server->seat);
+	}
+}
+
+/* moves the focused window to another workspace, matches i3's default of
+ * moving without following, the current workspace stays on screen */
+static void move_focused_to_workspace(struct gl3_server *server, int ws) {
+	struct gl3_toplevel *toplevel = focused_toplevel(server);
+	if (toplevel == NULL || toplevel->workspace == ws) {
+		return;
+	}
+	toplevel->workspace = ws;
+	arrange(server);
+	/* the window just left, focus whatever's left on this workspace */
+	struct gl3_toplevel *t, *replacement = NULL;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->workspace == server->current_workspace) {
+			replacement = t;
+			break;
+		}
+	}
+	if (replacement != NULL) {
+		focus_toplevel(replacement);
+	} else {
+		wlr_seat_keyboard_notify_clear_focus(server->seat);
+	}
+}
+
+/* runs a shell command detached from the compositor */
 static void spawn(const char *cmd) {
+	/* no error check on fork, fine here but not for anything critical */
 	if (fork() == 0) {
 		setsid();
 		execl("/bin/sh", "/bin/sh", "-c", cmd, (void *)NULL);
@@ -254,42 +440,31 @@ static void spawn(const char *cmd) {
 
 static void keyboard_handle_modifiers(
 		struct wl_listener *listener, void *data) {
-	/* this event is raised when a modifier key, such as shift or alt, is
-	 * pressed. we simply communicate this to the client. */
+	/* fires when shift, alt, etc get pressed or released */
 	struct gl3_keyboard *keyboard =
 		wl_container_of(listener, keyboard, modifiers);
-	/*
-	 * a seat can only have one keyboard, but this is a limitation of the
-	 * wayland protocol - not wlroots. we assign all connected keyboards to the
-	 * same seat. you can swap out the underlying wlr_keyboard like this and
-	 * wlr_seat handles this transparently.
-	 */
+	/* a seat only has one keyboard, so we swap in whichever one sent this */
 	wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
-	/* send modifiers to the client. */
+	/* pass the modifier state to the focused client */
 	wlr_seat_keyboard_notify_modifiers(keyboard->server->seat,
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-static bool handle_keybinding(struct gl3_server *server, xkb_keysym_t sym) {
-	/*
-	 * here we handle compositor keybindings. this is when the compositor is
-	 * processing keys, rather than passing them on to the client for its own
-	 * processing.
-	 *
-	 * this function assumes super (the "spiral" modifier) is held down.
-	 */
+static bool handle_keybinding(struct gl3_server *server, xkb_keysym_t sym,
+		bool shift) {
+	/* handles compositor keybinds, assumes super is already held down */
 	switch (sym) {
 	case XKB_KEY_Escape:
-		/* super+escape: pierce the heavens elsewhere - quit. */
+		/* super+escape - quit */
 		wl_display_terminate(server->wl_display);
 		break;
 	case XKB_KEY_Return:
-		/* super+return: spawn a terminal. */
+		/* super+return - spawn a terminal */
 		spawn(GL3_TERMINAL);
 		break;
 	case XKB_KEY_q:
 	case XKB_KEY_Q: {
-		/* super+q: close the focused window. */
+		/* super+q - close the focused window */
 		struct wlr_surface *focused =
 			server->seat->keyboard_state.focused_surface;
 		struct wlr_xdg_toplevel *xt = focused ?
@@ -301,9 +476,40 @@ static bool handle_keybinding(struct gl3_server *server, xkb_keysym_t sym) {
 	}
 	case XKB_KEY_j:
 	case XKB_KEY_J:
-		/* super+j: cycle focus to the next window. */
+		/* super+j - cycle focus to the next window */
 		focus_next(server);
 		break;
+	case XKB_KEY_h:
+	case XKB_KEY_H:
+		/* super+h - shrink the master column */
+		if (server->master_ratio > 1) {
+			server->master_ratio--;
+			arrange(server);
+		}
+		break;
+	case XKB_KEY_l:
+	case XKB_KEY_L:
+		/* super+l - grow the master column */
+		if (server->master_ratio < 9) {
+			server->master_ratio++;
+			arrange(server);
+		}
+		break;
+	case XKB_KEY_1: case XKB_KEY_2: case XKB_KEY_3: case XKB_KEY_4:
+	case XKB_KEY_5: case XKB_KEY_6: case XKB_KEY_7: case XKB_KEY_8:
+	case XKB_KEY_9: case XKB_KEY_0: {
+		/* super+1-0 - switch workspace, super+shift+1-0 - move window there */
+		int ws = (sym == XKB_KEY_0) ? GL3_NUM_WORKSPACES : (int)(sym - XKB_KEY_1) + 1;
+		if (shift) {
+			move_focused_to_workspace(server, ws);
+		} else {
+			switch_workspace(server, ws);
+		}
+		break;
+	}
+	/* TODO: still no keybind to swap which window is master, or to move a
+	 * window from stack into master directly, only the ratio is adjustable
+	 * for now. */
 	default:
 		return false;
 	}
@@ -312,16 +518,16 @@ static bool handle_keybinding(struct gl3_server *server, xkb_keysym_t sym) {
 
 static void keyboard_handle_key(
 		struct wl_listener *listener, void *data) {
-	/* this event is raised when a key is pressed or released. */
+	/* fires on every key press and release */
 	struct gl3_keyboard *keyboard =
 		wl_container_of(listener, keyboard, key);
 	struct gl3_server *server = keyboard->server;
 	struct wlr_keyboard_key_event *event = data;
 	struct wlr_seat *seat = server->seat;
 
-	/* translate libinput keycode -> xkbcommon */
+	/* libinput keycode to xkbcommon keycode */
 	uint32_t keycode = event->keycode + 8;
-	/* get a list of keysyms based on the keymap for this keyboard */
+	/* look up which keysyms this keycode maps to */
 	const xkb_keysym_t *syms;
 	int nsyms = xkb_state_key_get_syms(
 			keyboard->wlr_keyboard->xkb_state, keycode, &syms);
@@ -330,15 +536,15 @@ static void keyboard_handle_key(
 	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
 	if ((modifiers & WLR_MODIFIER_LOGO) &&
 			event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		/* if super is held down and this button was _pressed_, we attempt to
-		 * process it as a compositor keybinding. */
+		/* super is held and this key was pressed, try it as a keybind */
+		bool shift = modifiers & WLR_MODIFIER_SHIFT;
 		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i]);
+			handled = handle_keybinding(server, syms[i], shift);
 		}
 	}
 
 	if (!handled) {
-		/* otherwise, we pass it along to the client. */
+		/* not a keybind, so pass it through to the client */
 		wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(seat, event->time_msec,
 			event->keycode, event->state);
@@ -346,10 +552,7 @@ static void keyboard_handle_key(
 }
 
 static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
-	/* this event is raised by the keyboard base wlr_input_device to signal
-	 * the destruction of the wlr_keyboard. it will no longer receive events
-	 * and should be destroyed.
-	 */
+	/* the underlying keyboard device is gone, clean up */
 	struct gl3_keyboard *keyboard =
 		wl_container_of(listener, keyboard, destroy);
 	wl_list_remove(&keyboard->modifiers.link);
@@ -367,8 +570,7 @@ static void server_new_keyboard(struct gl3_server *server,
 	keyboard->server = server;
 	keyboard->wlr_keyboard = wlr_keyboard;
 
-	/* we need to prepare an xkb keymap and assign it to the keyboard. this
-	 * assumes the defaults (e.g. layout = "us"). */
+	/* set up the keymap, assumes defaults like us layout */
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
 		XKB_KEYMAP_COMPILE_NO_FLAGS);
@@ -378,7 +580,7 @@ static void server_new_keyboard(struct gl3_server *server,
 	xkb_context_unref(context);
 	wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
-	/* here we set up listeners for keyboard events. */
+	/* listen for key and modifier events on this keyboard */
 	keyboard->modifiers.notify = keyboard_handle_modifiers;
 	wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
 	keyboard->key.notify = keyboard_handle_key;
@@ -388,22 +590,18 @@ static void server_new_keyboard(struct gl3_server *server,
 
 	wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
 
-	/* and add the keyboard to our list of keyboards */
+	/* track it in our list of keyboards */
 	wl_list_insert(&server->keyboards, &keyboard->link);
 }
 
 static void server_new_pointer(struct gl3_server *server,
 		struct wlr_input_device *device) {
-	/* we don't do anything special with pointers. all of our pointer handling
-	 * is proxied through wlr_cursor. on another compositor, you might take this
-	 * opportunity to do libinput configuration on the device to set
-	 * acceleration, etc. */
+	/* no special handling, wlr_cursor deals with pointers for us */
 	wlr_cursor_attach_input_device(server->cursor, device);
 }
 
 static void server_new_input(struct wl_listener *listener, void *data) {
-	/* this event is raised by the backend when a new input device becomes
-	 * available. */
+	/* fires when the backend finds a new input device */
 	struct gl3_server *server =
 		wl_container_of(listener, server, new_input);
 	struct wlr_input_device *device = data;
@@ -417,9 +615,7 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 	default:
 		break;
 	}
-	/* we need to let the wlr_seat know what our capabilities are, which is
-	 * communiciated to the client. in gl3 we always have a cursor, even if
-	 * there are no pointer devices, so we always include that capability. */
+	/* tell the seat what we support, gl3 always has a cursor */
 	uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
 	if (!wl_list_empty(&server->keyboards)) {
 		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
@@ -430,17 +626,13 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 static void seat_request_cursor(struct wl_listener *listener, void *data) {
 	struct gl3_server *server = wl_container_of(
 			listener, server, request_cursor);
-	/* this event is raised by the seat when a client provides a cursor image */
+	/* fires when a client wants to set the cursor image */
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
 	struct wlr_seat_client *focused_client =
 		server->seat->pointer_state.focused_client;
-	/* this can be sent by any client, so we check to make sure this one is
-	 * actually has pointer focus first. */
+	/* only honor this if the client actually has pointer focus */
 	if (focused_client == event->seat_client) {
-		/* once we've vetted the client, we can tell the cursor to use the
-		 * provided surface as the cursor image. it will set the hardware cursor
-		 * on the output that it's currently on and continue to do so as the
-		 * cursor moves between outputs. */
+		/* use the client's surface as the cursor image */
 		wlr_cursor_set_surface(server->cursor, event->surface,
 				event->hotspot_x, event->hotspot_y);
 	}
@@ -449,9 +641,7 @@ static void seat_request_cursor(struct wl_listener *listener, void *data) {
 static void seat_pointer_focus_change(struct wl_listener *listener, void *data) {
 	struct gl3_server *server = wl_container_of(
 			listener, server, pointer_focus_change);
-	/* this event is raised when the pointer focus is changed, including when the
-	 * client is closed. we set the cursor image to its default if target surface
-	 * is null */
+	/* fires when pointer focus moves, including on window close */
 	struct wlr_seat_pointer_focus_change_event *event = data;
 	if (event->new_surface == NULL) {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
@@ -459,10 +649,7 @@ static void seat_pointer_focus_change(struct wl_listener *listener, void *data) 
 }
 
 static void seat_request_set_selection(struct wl_listener *listener, void *data) {
-	/* this event is raised by the seat when a client wants to set the selection,
-	 * usually when the user copies something. wlroots allows compositors to
-	 * ignore such requests if they so choose, but in gl3 we always honor
-	 */
+	/* fires on copy, gl3 always honors the selection request */
 	struct gl3_server *server = wl_container_of(
 			listener, server, request_set_selection);
 	struct wlr_seat_request_set_selection_event *event = data;
@@ -472,9 +659,7 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 static struct gl3_toplevel *desktop_toplevel_at(
 		struct gl3_server *server, double lx, double ly,
 		struct wlr_surface **surface, double *sx, double *sy) {
-	/* this returns the topmost node in the scene at the given layout coords.
-	 * we only care about surface nodes as we are specifically looking for a
-	 * surface in the surface tree of a gl3_toplevel. */
+	/* finds the topmost surface at these layout coordinates */
 	struct wlr_scene_node *node = wlr_scene_node_at(
 		&server->scene->tree.node, lx, ly, sx, sy);
 	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
@@ -488,8 +673,7 @@ static struct gl3_toplevel *desktop_toplevel_at(
 	}
 
 	*surface = scene_surface->surface;
-	/* find the node corresponding to the gl3_toplevel at the root of this
-	 * surface tree, it is the only one for which we set the data field. */
+	/* walk up to the tree node holding the gl3_toplevel data */
 	struct wlr_scene_tree *tree = node->parent;
 	while (tree != NULL && tree->node.data == NULL) {
 		tree = tree->node.parent;
@@ -498,13 +682,13 @@ static struct gl3_toplevel *desktop_toplevel_at(
 }
 
 static void reset_cursor_mode(struct gl3_server *server) {
-	/* reset the cursor mode to passthrough. */
+	/* back to normal, no window grabbed */
 	server->cursor_mode = GL3_CURSOR_PASSTHROUGH;
 	server->grabbed_toplevel = NULL;
 }
 
 static void process_cursor_move(struct gl3_server *server) {
-	/* move the grabbed toplevel to the new position. */
+	/* move the grabbed window to follow the cursor */
 	struct gl3_toplevel *toplevel = server->grabbed_toplevel;
 	wlr_scene_node_set_position(&toplevel->scene_tree->node,
 		server->cursor->x - server->grab_x,
@@ -512,16 +696,8 @@ static void process_cursor_move(struct gl3_server *server) {
 }
 
 static void process_cursor_resize(struct gl3_server *server) {
-	/*
-	 * resizing the grabbed toplevel can be a little bit complicated, because we
-	 * could be resizing from any corner or edge. this not only resizes the
-	 * toplevel on one or two axes, but can also move the toplevel if you resize
-	 * from the top or left edges (or top-left corner).
-	 *
-	 * note that some shortcuts are taken here. in a more fleshed-out
-	 * compositor, you'd wait for the client to prepare a buffer at the new
-	 * size, then commit any movement that was prepared.
-	 */
+	/* resize from whichever edge or corner was grabbed */
+	/* takes shortcuts, doesn't wait for the client to commit the new size */
 	struct gl3_toplevel *toplevel = server->grabbed_toplevel;
 	double border_x = server->cursor->x - server->grab_x;
 	double border_y = server->cursor->y - server->grab_y;
@@ -563,7 +739,7 @@ static void process_cursor_resize(struct gl3_server *server) {
 }
 
 static void process_cursor_motion(struct gl3_server *server, uint32_t time) {
-	/* if the mode is non-passthrough, delegate to those functions. */
+	/* moving or resizing a window, handle that instead */
 	if (server->cursor_mode == GL3_CURSOR_MOVE) {
 		process_cursor_move(server);
 		return;
@@ -572,50 +748,32 @@ static void process_cursor_motion(struct gl3_server *server, uint32_t time) {
 		return;
 	}
 
-	/* otherwise, find the toplevel under the pointer and send the event along. */
+	/* otherwise find what's under the cursor and forward the event */
 	double sx, sy;
 	struct wlr_seat *seat = server->seat;
 	struct wlr_surface *surface = NULL;
 	struct gl3_toplevel *toplevel = desktop_toplevel_at(server,
 			server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 	if (!toplevel) {
-		/* if there's no toplevel under the cursor, set the cursor image to a
-		 * default. this is what makes the cursor image appear when you move it
-		 * around the screen, not over any toplevels. */
+		/* nothing under the cursor, show the default cursor image */
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
 	}
 	if (surface) {
-		/*
-		 * send pointer enter and motion events.
-		 *
-		 * the enter event gives the surface "pointer focus", which is distinct
-		 * from keyboard focus. you get pointer focus by moving the pointer over
-		 * a window.
-		 *
-		 * note that wlroots will avoid sending duplicate enter/motion events if
-		 * the surface has already has pointer focus or if the client is already
-		 * aware of the coordinates passed.
-		 */
+		/* enter gives pointer focus, separate from keyboard focus */
 		wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
 		wlr_seat_pointer_notify_motion(seat, time, sx, sy);
 	} else {
-		/* clear pointer focus so future button events and such are not sent to
-		 * the last client to have the cursor over it. */
+		/* nothing under the cursor, clear pointer focus */
 		wlr_seat_pointer_clear_focus(seat);
 	}
 }
 
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
-	/* this event is forwarded by the cursor when a pointer emits a _relative_
-	 * pointer motion event (i.e. a delta) */
+	/* fires on relative pointer motion, ie a delta */
 	struct gl3_server *server =
 		wl_container_of(listener, server, cursor_motion);
 	struct wlr_pointer_motion_event *event = data;
-	/* the cursor doesn't move unless we tell it to. the cursor automatically
-	 * handles constraining the motion to the output layout, as well as any
-	 * special configuration applied for the specific input device which
-	 * generated the event. you can pass null for the device if you want to move
-	 * the cursor around without any input. */
+	/* moves the cursor, wlr_cursor clamps it to the output layout */
 	wlr_cursor_move(server->cursor, &event->pointer->base,
 			event->delta_x, event->delta_y);
 	process_cursor_motion(server, event->time_msec);
@@ -623,12 +781,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
 
 static void server_cursor_motion_absolute(
 		struct wl_listener *listener, void *data) {
-	/* this event is forwarded by the cursor when a pointer emits an _absolute_
-	 * motion event, from 0..1 on each axis. this happens, for example, when
-	 * wlroots is running under a wayland window rather than kms+drm, and you
-	 * move the mouse over the window. you could enter the window from any edge,
-	 * so we have to warp the mouse there. there is also some hardware which
-	 * emits these events. */
+	/* fires on absolute pointer motion, ie nested window or a tablet */
 	struct gl3_server *server =
 		wl_container_of(listener, server, cursor_motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
@@ -638,19 +791,18 @@ static void server_cursor_motion_absolute(
 }
 
 static void server_cursor_button(struct wl_listener *listener, void *data) {
-	/* this event is forwarded by the cursor when a pointer emits a button
-	 * event. */
+	/* fires on mouse button press or release */
 	struct gl3_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
-	/* notify the client with pointer focus that a button press has occurred */
+	/* tell the focused client about the button event */
 	wlr_seat_pointer_notify_button(server->seat,
 			event->time_msec, event->button, event->state);
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		/* if you released any buttons, we exit interactive move/resize mode. */
+		/* releasing ends any move or resize in progress */
 		reset_cursor_mode(server);
 	} else {
-		/* focus that client if the button was _pressed_ */
+		/* pressed, so focus whatever is under the cursor */
 		double sx, sy;
 		struct wlr_surface *surface = NULL;
 		struct gl3_toplevel *toplevel = desktop_toplevel_at(server,
@@ -660,38 +812,33 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 }
 
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
-	/* this event is forwarded by the cursor when a pointer emits an axis event,
-	 * for example when you move the scroll wheel. */
+	/* fires on scroll wheel movement */
 	struct gl3_server *server =
 		wl_container_of(listener, server, cursor_axis);
 	struct wlr_pointer_axis_event *event = data;
-	/* notify the client with pointer focus of the axis event. */
+	/* pass the scroll event to the focused client */
 	wlr_seat_pointer_notify_axis(server->seat,
 			event->time_msec, event->orientation, event->delta,
 			event->delta_discrete, event->source, event->relative_direction);
 }
 
 static void server_cursor_frame(struct wl_listener *listener, void *data) {
-	/* this event is forwarded by the cursor when a pointer emits an frame
-	 * event. frame events are sent after regular pointer events to group
-	 * multiple events together. for instance, two axis events may happen at the
-	 * same time, in which case a frame event won't be sent in between. */
+	/* groups pointer events sent at the same time */
 	struct gl3_server *server =
 		wl_container_of(listener, server, cursor_frame);
-	/* notify the client with pointer focus of the frame event. */
+	/* pass the frame event to the focused client */
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
-	/* this function is called every time an output is ready to display a frame,
-	 * generally at the output's refresh rate (e.g. 60hz). */
+	/* fires when an output is ready for a new frame, usually at 60hz */
 	struct gl3_output *output = wl_container_of(listener, output, frame);
 	struct wlr_scene *scene = output->server->scene;
 
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		scene, output->wlr_output);
 
-	/* render the scene if needed and commit the output */
+	/* render if needed and push the frame to the screen */
 	wlr_scene_output_commit(scene_output, NULL);
 
 	struct timespec now;
@@ -700,9 +847,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 }
 
 static void output_request_state(struct wl_listener *listener, void *data) {
-	/* this function is called when the backend requests a new state for
-	 * the output. for example, wayland and x11 backends request a new mode
-	 * when the output window is resized. */
+	/* fires when the backend wants a new output state, eg on resize */
 	struct gl3_output *output = wl_container_of(listener, output, request_state);
 	const struct wlr_output_event_request_state *event = data;
 	wlr_output_commit_state(output->wlr_output, event->state);
@@ -719,63 +864,47 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {
-	/* this event is raised by the backend when a new output (aka a display or
-	 * monitor) becomes available. */
+	/* fires when a new monitor or display becomes available */
 	struct gl3_server *server =
 		wl_container_of(listener, server, new_output);
 	struct wlr_output *wlr_output = data;
 
-	/* configures the output created by the backend to use our allocator
-	 * and our renderer. must be done once, before committing the output */
+	/* wire the output up to our renderer and allocator */
 	wlr_output_init_render(wlr_output, server->allocator, server->renderer);
 
-	/* the output may be disabled, switch it on. */
+	/* the output may start disabled, so turn it on */
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, true);
 
-	/* some backends don't have modes. drm+kms does, and we need to set a mode
-	 * before we can use the output. the mode is a tuple of (width, height,
-	 * refresh rate), and each monitor supports only a specific set of modes. we
-	 * just pick the monitor's preferred mode, a more sophisticated compositor
-	 * would let the user configure it. */
+	/* pick the monitor's preferred mode, we don't let users choose yet */
 	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
 	if (mode != NULL) {
 		wlr_output_state_set_mode(&state, mode);
 	}
 
-	/* atomically applies the new output state. */
+	/* apply the new state all at once */
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 
-	/* allocates and configures our state for this output */
+	/* track this output in our own struct */
 	struct gl3_output *output = calloc(1, sizeof(*output));
 	output->wlr_output = wlr_output;
 	output->server = server;
 
-	/* sets up a listener for the frame event. */
+	/* listen for frame, state, and destroy events */
 	output->frame.notify = output_frame;
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
 
-	/* sets up a listener for the state request event. */
 	output->request_state.notify = output_request_state;
 	wl_signal_add(&wlr_output->events.request_state, &output->request_state);
 
-	/* sets up a listener for the destroy event. */
 	output->destroy.notify = output_destroy;
 	wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 
 	wl_list_insert(&server->outputs, &output->link);
 
-	/* adds this to the output layout. the add_auto function arranges outputs
-	 * from left-to-right in the order they appear. a more sophisticated
-	 * compositor would let the user configure the arrangement of outputs in the
-	 * layout.
-	 *
-	 * the output layout utility automatically adds a wl_output global to the
-	 * display, which wayland clients can see to find out information about the
-	 * output (such as dpi, scale factor, manufacturer, etc).
-	 */
+	/* add_auto arranges outputs left to right, no user config yet */
 	struct wlr_output_layout_output *l_output = wlr_output_layout_add_auto(server->output_layout,
 		wlr_output);
 	struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
@@ -783,9 +912,11 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
-	/* called when the surface is mapped, or ready to display on-screen. */
+	/* fires when the window is ready to show on screen */
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, map);
 
+	/* new windows open on whatever workspace is visible right now */
+	toplevel->workspace = toplevel->server->current_workspace;
 	wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
 
 	arrange(toplevel->server);
@@ -793,10 +924,10 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 }
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
-	/* called when the surface is unmapped, and should no longer be shown. */
+	/* fires when the window should no longer be shown */
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
 
-	/* reset the cursor mode if the grabbed toplevel was unmapped. */
+	/* if this window was being moved or resized, stop that */
 	if (toplevel == toplevel->server->grabbed_toplevel) {
 		reset_cursor_mode(toplevel->server);
 	}
@@ -807,20 +938,17 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 }
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
-	/* called when a new surface state is committed. */
+	/* fires when the client commits a new surface state */
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
 
 	if (toplevel->xdg_toplevel->base->initial_commit) {
-		/* when an xdg_surface performs an initial commit, the compositor must
-		 * reply with a configure so the client can map the surface. gl3
-		 * configures the xdg_toplevel with 0,0 size to let the client pick the
-		 * dimensions itself. */
+		/* first commit needs a reply, let the client pick its own size */
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
 	}
 }
 
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
-	/* called when the xdg_toplevel is destroyed. */
+	/* fires when the window is destroyed */
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, destroy);
 
 	wl_list_remove(&toplevel->map.link);
@@ -837,9 +965,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 
 static void begin_interactive(struct gl3_toplevel *toplevel,
 		enum gl3_cursor_mode mode, uint32_t edges) {
-	/* this function sets up an interactive move or resize operation, where the
-	 * compositor stops propagating pointer events to clients and instead
-	 * consumes them itself, to move or resize windows. */
+	/* starts a move or resize, we grab pointer input until it's done */
 	struct gl3_server *server = toplevel->server;
 
 	server->grabbed_toplevel = toplevel;
@@ -868,22 +994,16 @@ static void begin_interactive(struct gl3_toplevel *toplevel,
 
 static void xdg_toplevel_request_move(
 		struct wl_listener *listener, void *data) {
-	/* this event is raised when a client would like to begin an interactive
-	 * move, typically because the user clicked on their client-side
-	 * decorations. note that a more sophisticated compositor should check the
-	 * provided serial against a list of button press serials sent to this
-	 * client, to prevent the client from requesting this whenever they want. */
+	/* client asked to start a move, usually from its titlebar */
+	/* TODO: doesn't check the button press serial, a client could spam this */
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, request_move);
 	begin_interactive(toplevel, GL3_CURSOR_MOVE, 0);
 }
 
 static void xdg_toplevel_request_resize(
 		struct wl_listener *listener, void *data) {
-	/* this event is raised when a client would like to begin an interactive
-	 * resize, typically because the user clicked on their client-side
-	 * decorations. note that a more sophisticated compositor should check the
-	 * provided serial against a list of button press serials sent to this
-	 * client, to prevent the client from requesting this whenever they want. */
+	/* client asked to start a resize, usually from its titlebar */
+	/* TODO: doesn't check the button press serial, a client could spam this */
 	struct wlr_xdg_toplevel_resize_event *event = data;
 	struct gl3_toplevel *toplevel = wl_container_of(listener, toplevel, request_resize);
 	begin_interactive(toplevel, GL3_CURSOR_RESIZE, event->edges);
@@ -891,13 +1011,7 @@ static void xdg_toplevel_request_resize(
 
 static void xdg_toplevel_request_maximize(
 		struct wl_listener *listener, void *data) {
-	/* this event is raised when a client would like to maximize itself,
-	 * typically because the user clicked on the maximize button on client-side
-	 * decorations. gl3 doesn't support maximization, but to conform to
-	 * xdg-shell protocol we still must send a configure.
-	 * wlr_xdg_surface_schedule_configure() is used to send an empty reply.
-	 * however, if the request was sent before an initial commit, we don't do
-	 * anything and let the client finish the initial surface setup. */
+	/* gl3 doesn't maximize windows, but still must reply per protocol */
 	struct gl3_toplevel *toplevel =
 		wl_container_of(listener, toplevel, request_maximize);
 	if (toplevel->xdg_toplevel->base->initialized) {
@@ -907,7 +1021,7 @@ static void xdg_toplevel_request_maximize(
 
 static void xdg_toplevel_request_fullscreen(
 		struct wl_listener *listener, void *data) {
-	/* just as with request_maximize, we must send a configure here. */
+	/* same as request_maximize, must still send a reply */
 	struct gl3_toplevel *toplevel =
 		wl_container_of(listener, toplevel, request_fullscreen);
 	if (toplevel->xdg_toplevel->base->initialized) {
@@ -916,11 +1030,11 @@ static void xdg_toplevel_request_fullscreen(
 }
 
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
-	/* this event is raised when a client creates a new toplevel (application window). */
+	/* fires when a client opens a new application window */
 	struct gl3_server *server = wl_container_of(listener, server, new_xdg_toplevel);
 	struct wlr_xdg_toplevel *xdg_toplevel = data;
 
-	/* allocate a gl3_toplevel for this surface */
+	/* make a gl3_toplevel to track this window */
 	struct gl3_toplevel *toplevel = calloc(1, sizeof(*toplevel));
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_toplevel;
@@ -929,7 +1043,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->scene_tree->node.data = toplevel;
 	xdg_toplevel->base->data = toplevel->scene_tree;
 
-	/* listen to the various events it can emit */
+	/* listen for the events this window can emit */
 	toplevel->map.notify = xdg_toplevel_map;
 	wl_signal_add(&xdg_toplevel->base->surface->events.map, &toplevel->map);
 	toplevel->unmap.notify = xdg_toplevel_unmap;
@@ -940,7 +1054,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->destroy.notify = xdg_toplevel_destroy;
 	wl_signal_add(&xdg_toplevel->events.destroy, &toplevel->destroy);
 
-	/* cotd */
+	/* move, resize, maximize, fullscreen requests */
 	toplevel->request_move.notify = xdg_toplevel_request_move;
 	wl_signal_add(&xdg_toplevel->events.request_move, &toplevel->request_move);
 	toplevel->request_resize.notify = xdg_toplevel_request_resize;
@@ -952,21 +1066,17 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 }
 
 static void xdg_popup_commit(struct wl_listener *listener, void *data) {
-	/* called when a new surface state is committed. */
+	/* fires when the popup commits a new surface state */
 	struct gl3_popup *popup = wl_container_of(listener, popup, commit);
 
 	if (popup->xdg_popup->base->initial_commit) {
-		/* when an xdg_surface performs an initial commit, the compositor must
-		 * reply with a configure so the client can map the surface.
-		 * gl3 sends an empty configure. a more sophisticated compositor
-		 * might change an xdg_popup's geometry to ensure it's not positioned
-		 * off-screen, for example. */
+		/* first commit needs a reply, gl3 sends an empty one */
 		wlr_xdg_surface_schedule_configure(popup->xdg_popup->base);
 	}
 }
 
 static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
-	/* called when the xdg_popup is destroyed. */
+	/* fires when the popup is destroyed */
 	struct gl3_popup *popup = wl_container_of(listener, popup, destroy);
 
 	wl_list_remove(&popup->commit.link);
@@ -976,17 +1086,13 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 }
 
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
-	/* this event is raised when a client creates a new popup. */
+	/* fires when a client opens a new popup, eg a context menu */
 	struct wlr_xdg_popup *xdg_popup = data;
 
 	struct gl3_popup *popup = calloc(1, sizeof(*popup));
 	popup->xdg_popup = xdg_popup;
 
-	/* we must add xdg popups to the scene graph so they get rendered. the
-	 * wlroots scene graph provides a helper for this, but to use it we must
-	 * provide the proper parent scene node of the xdg popup. to enable this,
-	 * we always set the user data field of xdg_surfaces to the corresponding
-	 * scene node. */
+	/* popups need adding to the scene graph under their parent */
 	struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
 	assert(parent != NULL);
 	struct wlr_scene_tree *parent_tree = parent->data;
@@ -1001,7 +1107,7 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
-	/* auto-reap spawned children so terminals etc. don't become zombies. */
+	/* auto-reap spawned children, so terminals don't turn into zombies */
 	signal(SIGCHLD, SIG_IGN);
 	char *startup_cmd = NULL;
 
@@ -1012,33 +1118,28 @@ int main(int argc, char *argv[]) {
 			startup_cmd = optarg;
 			break;
 		default:
-			printf("Usage: %s [-s startup command]\n", argv[0]);
+			printf("usage: %s [-s startup command]\n", argv[0]);
 			return 0;
 		}
 	}
 	if (optind < argc) {
-		printf("Usage: %s [-s startup command]\n", argv[0]);
+		printf("usage: %s [-s startup command]\n", argv[0]);
 		return 0;
 	}
 
 	struct gl3_server server = {0};
-	/* the wayland display is managed by libwayland. it handles accepting
-	 * clients from the unix socket, managing wayland globals, and so on. */
+	server.master_ratio = GL3_MASTER_RATIO;
+	server.current_workspace = 1;
+	/* libwayland manages the display, sockets, and globals for us */
 	server.wl_display = wl_display_create();
-	/* the backend is a wlroots feature which abstracts the underlying input and
-	 * output hardware. the autocreate option will choose the most suitable
-	 * backend based on the current environment, such as opening an x11 window
-	 * if an x11 server is running. */
+	/* picks the best backend for the environment, eg x11 window vs real drm */
 	server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
 	if (server.backend == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_backend");
 		return 1;
 	}
 
-	/* autocreates a renderer, either pixman, gles2 or vulkan for us. the user
-	 * can also specify a renderer using the wlr_renderer env var.
-	 * the renderer is responsible for defining the various pixel formats it
-	 * supports for shared memory, this configures that for clients. */
+	/* picks pixman, gles2, or vulkan, overridable with the wlr_renderer env var */
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
@@ -1047,10 +1148,7 @@ int main(int argc, char *argv[]) {
 
 	wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
-	/* autocreates an allocator for us.
-	 * the allocator is the bridge between the renderer and the backend. it
-	 * handles the buffer creation, allowing wlroots to render onto the
-	 * screen */
+	/* bridges the renderer and backend, handles buffer creation */
 	server.allocator = wlr_allocator_autocreate(server.backend,
 		server.renderer);
 	if (server.allocator == NULL) {
@@ -1058,48 +1156,42 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	/* this creates some hands-off wlroots interfaces. the compositor is
-	 * necessary for clients to allocate surfaces, the subcompositor allows to
-	 * assign the role of subsurfaces to surfaces and the data device manager
-	 * handles the clipboard. each of these wlroots interfaces has room for you
-	 * to dig your fingers in and play with their behavior if you want. note that
-	 * the clients cannot set the selection directly without compositor approval,
-	 * see the handling of the request_set_selection event below.*/
+	/* compositor lets clients make surfaces, this also sets up the clipboard */
 	wlr_compositor_create(server.wl_display, 5, server.renderer);
 	wlr_subcompositor_create(server.wl_display);
 	wlr_data_device_manager_create(server.wl_display);
 
-	/* creates an output layout, which a wlroots utility for working with an
-	 * arrangement of screens in a physical layout. */
+	/* tracks the physical arrangement of screens */
 	server.output_layout = wlr_output_layout_create(server.wl_display);
 
-	/* configure a listener to be notified when new outputs are available on the
-	 * backend. */
+	/* listen for new monitors becoming available */
 	wl_list_init(&server.outputs);
 	server.new_output.notify = server_new_output;
 	wl_signal_add(&server.backend->events.new_output, &server.new_output);
 
-	/* create a scene graph. this is a wlroots abstraction that handles all
-	 * rendering and damage tracking. all the compositor author needs to do
-	 * is add things that should be rendered to the scene graph at the proper
-	 * positions and then call wlr_scene_output_commit() to render a frame if
-	 * necessary.
-	 */
+	/* the scene graph handles rendering and damage tracking for us */
 	server.scene = wlr_scene_create();
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
 
-	/* deep gurren-crimson desktop background behind everything. the rect is
-	 * made far larger than any plausible output and lowered to the bottom so
-	 * it covers the whole layout without per-output resize tracking. */
-	struct wlr_scene_rect *bg = wlr_scene_rect_create(&server.scene->tree,
-		1 << 15, 1 << 15, GL3_BG_COLOR);
-	wlr_scene_node_set_position(&bg->node, -(1 << 13), -(1 << 13));
-	wlr_scene_node_lower_to_bottom(&bg->node);
+	/* wallpaper, falls back to a solid crimson color if it fails to load */
+	/* TODO: doesn't scale or tile, only looks right on a single output the
+	 * same size as the image, multi-monitor setups need real handling here */
+	int bg_w = 0, bg_h = 0;
+	uint8_t *bg_pixels = load_jpeg_xrgb(GL3_BG_IMAGE, &bg_w, &bg_h);
+	if (bg_pixels != NULL) {
+		struct wlr_buffer *bg_buffer = gl3_image_buffer_create(bg_pixels, bg_w, bg_h);
+		struct wlr_scene_buffer *bg = wlr_scene_buffer_create(&server.scene->tree, bg_buffer);
+		wlr_buffer_drop(bg_buffer);
+		wlr_scene_node_set_position(&bg->node, 0, 0);
+		wlr_scene_node_lower_to_bottom(&bg->node);
+	} else {
+		struct wlr_scene_rect *bg = wlr_scene_rect_create(&server.scene->tree,
+			1 << 15, 1 << 15, GL3_BG_COLOR);
+		wlr_scene_node_set_position(&bg->node, -(1 << 13), -(1 << 13));
+		wlr_scene_node_lower_to_bottom(&bg->node);
+	}
 
-	/* set up xdg-shell version 3. the xdg-shell is a wayland protocol which is
-	 * used for application windows. for more detail on shells, refer to
-	 * https://drewdevault.com/2018/07/29/wayland-shells.html.
-	 */
+	/* xdg-shell is the wayland protocol for application windows */
 	wl_list_init(&server.toplevels);
 	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
 	server.new_xdg_toplevel.notify = server_new_xdg_toplevel;
@@ -1107,29 +1199,14 @@ int main(int argc, char *argv[]) {
 	server.new_xdg_popup.notify = server_new_xdg_popup;
 	wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
 
-	/*
-	 * creates a cursor, which is a wlroots utility for tracking the cursor
-	 * image shown on screen.
-	 */
+	/* tracks the cursor image shown on screen */
 	server.cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
 
-	/* creates an xcursor manager, another wlroots utility which loads up
-	 * xcursor themes to source cursor images from and makes sure that cursor
-	 * images are available at all scale factors on the screen (necessary for
-	 * hidpi support). */
+	/* loads xcursor themes, keeps cursor images sharp at any scale */
 	server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
 
-	/*
-	 * wlr_cursor *only* displays an image on screen. it does not move around
-	 * when the pointer moves. however, we can attach input devices to it, and
-	 * it will generate aggregate events for all of them. in these events, we
-	 * can choose how we want to process them, forwarding them to clients and
-	 * moving the cursor around. more detail on this process is described in
-	 * https://drewdevault.com/2018/07/17/input-handling-in-wlroots.html.
-	 *
-	 * and more comments are sprinkled throughout the notify functions above.
-	 */
+	/* wlr_cursor only draws an image, input devices drive it via events */
 	server.cursor_mode = GL3_CURSOR_PASSTHROUGH;
 	server.cursor_motion.notify = server_cursor_motion;
 	wl_signal_add(&server.cursor->events.motion, &server.cursor_motion);
@@ -1143,12 +1220,7 @@ int main(int argc, char *argv[]) {
 	server.cursor_frame.notify = server_cursor_frame;
 	wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
-	/*
-	 * configures a seat, which is a single "seat" at which a user sits and
-	 * operates the computer. this conceptually includes up to one keyboard,
-	 * pointer, touch, and drawing tablet device. we also rig up a listener to
-	 * let us know when new input devices are available on the backend.
-	 */
+	/* one seat covers keyboard, pointer, touch, and tablet for this user */
 	wl_list_init(&server.keyboards);
 	server.new_input.notify = server_new_input;
 	wl_signal_add(&server.backend->events.new_input, &server.new_input);
@@ -1163,43 +1235,39 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.seat->events.request_set_selection,
 			&server.request_set_selection);
 
-	/* add a unix socket to the wayland display. */
+	/* add a unix socket for clients to connect to */
 	const char *socket = wl_display_add_socket_auto(server.wl_display);
 	if (!socket) {
 		wlr_backend_destroy(server.backend);
 		return 1;
 	}
 
-	/* start the backend. this will enumerate outputs and inputs, become the drm
-	 * master, etc */
+	/* enumerates outputs and inputs, becomes drm master, etc */
 	if (!wlr_backend_start(server.backend)) {
 		wlr_backend_destroy(server.backend);
 		wl_display_destroy(server.wl_display);
 		return 1;
 	}
 
-	/* set the wayland_display environment variable to our socket and run the
-	 * startup command if requested. */
+	/* point clients at our socket, then run the startup command */
 	setenv("WAYLAND_DISPLAY", socket, true);
 	if (startup_cmd) {
 		if (fork() == 0) {
 			execl("/bin/sh", "/bin/sh", "-c", startup_cmd, (void *)NULL);
 		}
 	}
-	/* run the wayland event loop. this does not return until you exit the
-	 * compositor. starting the backend rigged up all of the necessary event
-	 * loop configuration to listen to libinput events, drm events, generate
-	 * frame events at the refresh rate, and so on. */
-	wlr_log(WLR_INFO, "gl3 // SpiralOS - pierce the heavens!");
-	wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s",
+	/* this blocks until the compositor exits */
+	wlr_log(WLR_INFO, "gl3 // spiralos - pierce the heavens!");
+	wlr_log(WLR_INFO, "running wayland compositor on wayland_display=%s",
 			socket);
-	wlr_log(WLR_INFO, "Keys: Super+Return terminal, Super+Q close, "
-			"Super+J focus-next, Super+Escape quit");
+	wlr_log(WLR_INFO, "keys: super+return - terminal, super+q - close, "
+			"super+j - focus-next, super+h/l - master ratio, "
+			"super+1-0 - workspace, super+shift+1-0 - move to workspace, "
+			"super+escape - quit");
 	wl_display_run(server.wl_display);
 
 
-	/* once wl_display_run returns, we destroy all clients then shut down the
-	 * server. */
+	/* the loop exited, so shut everything down */
 	wl_display_destroy_clients(server.wl_display);
 
 	wl_list_remove(&server.new_xdg_toplevel.link);

@@ -16,19 +16,24 @@ tiling wm. current state is an early proof-of-concept.
 - **master/stack tiling**: the most-recently-opened window is the master (left
   column, 60% width); the rest stack in the right column, with gaps. re-tiles
   automatically as windows open/close.
-- deep crimson desktop background.
+- default wallpaper (`assets/background.jpg`), falls back to a solid crimson color if the image fails to load.
 - **super** ("spiral" modifier) keybindings:
   - `super+return` — spawn a terminal (`foot`)
   - `super+q` — close the focused window
   - `super+j` — cycle focus to the next window (without reshuffling tiles)
+  - `super+h` / `super+l` — shrink / grow the master column
+  - `super+1` through `super+0` — switch to workspace 1-10
+  - `super+shift+1` through `super+shift+0` — move the focused window to a workspace (does not follow, matches i3's default)
   - `super+escape` — quit
+- **workspaces**: 10 of them, i3-style. windows stay tagged to the workspace they opened on; switching workspaces hides everything not on it and re-tiles what's left.
 
 ## not done yet
 
 - no multi-monitor-aware layout (tiles across the whole combined layout box).
-- no workspaces/tags, no layer-shell (bars/panels), no xwayland.
-- no live config file — keybinds and layout ratios are `#define`s in `src/gl3.c`.
-- adjustable master ratio / moving windows between master and stack.
+- no layer-shell (bars/panels), no xwayland.
+- no live config file — keybinds are `#define`s in `src/gl3.c`.
+- no keybind to swap which window is master, or move a window from stack into master directly.
+- no workspace indicator anywhere (no bar), you have to just remember which one you're on.
 
 ## build & run
 
