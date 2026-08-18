@@ -8,8 +8,8 @@ with lib;
   config = mkIf config.spiralos.profiles.web.enable {
     environment.systemPackages = with pkgs; [
       nodejs_22
-      nodePackages.pnpm
-      nodePackages.typescript-language-server
+      pnpm
+      typescript-language-server
       deno
       bun
     ];

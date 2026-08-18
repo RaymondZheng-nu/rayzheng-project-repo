@@ -1,0 +1,54 @@
+# gl3 config, copy this to ~/.config/gl3/gl3.conf and edit it
+# lines starting with # are ignored, blank lines are ignored
+# gl3 only reads this file once, at startup, restart gl3 to pick up changes
+
+# command the terminal keybind spawns (super+return by default)
+terminal = foot
+
+# command the launcher keybind spawns (super+space by default), an app launcher
+# the default needs fuzzel installed - it's a real floating popup (via
+# wlr-layer-shell), not a terminal, lists PATH binaries and desktop entries,
+# and launches the selection itself. theme it separately in
+# ~/.config/fuzzel/fuzzel.ini if you want it to match gl3's colors
+launcher = fuzzel
+
+# gap in pixels between windows and around the screen edge
+gap = 10
+
+# starting width of the master column, 1-9, tenths of the screen width
+# 6 means the master column takes 60% of the width
+# super+h and super+l adjust this at runtime, this is just the starting value
+master_ratio = 6
+
+# border thickness in pixels around each window
+border_width = 3
+
+# border color on the focused window, hex, rrggbb or rrggbbaa
+border_active = eb3842
+
+# border color on unfocused windows, hex, rrggbb or rrggbbaa
+border_inactive = 302933
+
+# how much unfocused windows dim, 0.0 is invisible, 1.0 is no dimming at all
+inactive_opacity = 0.75
+
+# solid color shown if the wallpaper below fails to load, hex, rrggbb or rrggbbaa
+bg_color = 290507
+
+# path to a jpeg to use as the wallpaper, leave blank to use the built-in default
+# wallpaper =
+
+# keybinds, all held with the super key, value is a key name like "return",
+# "space", "q", "f1", see xkeyboard-config's keysym names for the full list,
+# matched case-insensitively. super+1-0 (switch workspace) and
+# super+shift+1-0 (move window to workspace) aren't configurable, they're
+# tied to the number row like every other tiling wm
+keybind_terminal = return
+keybind_launcher = space
+keybind_help = question
+keybind_close = q
+keybind_focus_next = j
+keybind_shrink_master = h
+keybind_grow_master = l
+keybind_swap_master = m
+keybind_quit = escape

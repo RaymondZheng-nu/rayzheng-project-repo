@@ -14,7 +14,7 @@ if [ -e "$STAMP" ] && [ "$force" = false ]; then
 fi
 
 whiptail --title "spiralos setup" --msgbox \
-  "welcome to spiralos.\n\nthis wizard sets up your system based on your hardware and how you plan to use it, and writes ${OUT}.\n\nre-run it anytime with: spiralos-wizard --force" \
+  "welcome to spiralos\n\nthis wizard sets up your system based on your hardware and how you plan to use it, and writes ${OUT}\n\nre-run it anytime with spiralos-wizard --force" \
   14 70
 
 # hardware detection
@@ -37,16 +37,16 @@ if compgen -G "/sys/class/power_supply/BAT*" > /dev/null 2>&1; then
 fi
 
 whiptail --title "detected hardware" --msgbox \
-  "gpu vendor: ${gpu_vendor}\nlaptop (battery detected): ${is_laptop}\n\nthese set sensible defaults, you can override anything by hand-editing ${OUT} later." \
+  "gpu vendor, ${gpu_vendor}\nlaptop (battery detected), ${is_laptop}\n\nthese set sensible defaults, you can override anything by hand-editing ${OUT} later" \
   12 70
 
 # use-case presets
 
-preset=$(whiptail --title "what will you mainly use this for?" --menu \
+preset=$(whiptail --title "what will you mainly use this for" --menu \
   "pick a starting preset, you can fine-tune profiles on the next screen" 20 70 7 \
   workstation "general engineering workstation (rust, python, web)" \
-  data-science "data science / ML (python, ml)" \
-  maker "maker, electronics, embedded, CAD/3D printing" \
+  data-science "data science / ml (python, ml)" \
+  maker "maker, electronics, embedded, cad/3d printing" \
   embedded "embedded / firmware development" \
   minimal "minimal, no profiles, just the spiralos base" \
   custom "choose profiles manually" \
@@ -83,10 +83,16 @@ mkdir -p /etc/nixos /etc/spiralos
 # touch a stub first, so it never points at a missing file
 CONF=/etc/nixos/configuration.nix
 touch "$OUT"
-# TODO: this sed only matches one "imports = [" line, a hand-edited
-# configuration.nix with different formatting silently gets skipped
+# best-effort, only matches a single "imports = [" line, a hand-edited
+# configuration.nix with different formatting won't match - checked below
+# so that case gets a manual-step prompt instead of silently doing nothing
 if [ -f "$CONF" ] && ! grep -q 'spiralos-profiles.nix' "$CONF"; then
   sed -i '0,/imports = \[/s//imports = [\n    .\/spiralos-profiles.nix/' "$CONF"
+  if ! grep -q 'spiralos-profiles.nix' "$CONF"; then
+    whiptail --title "manual step needed" --msgbox \
+      "couldn't find an \"imports = [ ... ]\" line to edit automatically in ${CONF}\n\nadd this line yourself, inside its imports list\n\n    ./spiralos-profiles.nix\n\nyour selected profiles were written to ${OUT} but won't take effect until it's imported" \
+      14 70
+  fi
 fi
 
 {
@@ -129,9 +135,13 @@ mkdir -p /etc/spiralos
 date > "$STAMP"
 
 whiptail --title "done" --msgbox \
-  "wrote ${OUT}.\n\nrun 'sudo nixos-rebuild switch' to apply, or do it now." \
+  "wrote ${OUT}\n\nrun 'sudo nixos-rebuild switch' to apply, or do it now" \
   10 70
 
-if whiptail --title "apply now?" --yesno "run nixos-rebuild switch now?" 8 60; then
-  nixos-rebuild switch || true
+if whiptail --title "apply now" --yesno "run nixos-rebuild switch now" 8 60; then
+  if ! nixos-rebuild switch; then
+    whiptail --title "rebuild failed" --msgbox \
+      "nixos-rebuild switch failed, your system wasn't changed, run it again by hand to see the full error, or fix ${OUT} and retry" \
+      10 70
+  fi
 fi

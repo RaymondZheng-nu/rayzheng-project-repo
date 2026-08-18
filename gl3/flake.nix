@@ -15,6 +15,9 @@
         wayland
         wayland-protocols
         wayland-scanner
+        # wlroots doesn't install a header for wlr-layer-shell-v1, gl3
+        # generates its own copy at build time from this xml (see Makefile)
+        wlr-protocols
         libinput
         libxkbcommon
         pixman
@@ -39,7 +42,11 @@
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = deps ++ (with pkgs; [ pkg-config gnumake gdb foot bear clang-tools ]);
+        # foot and fuzzel here are only for trying out the default
+        # terminal/launcher/help keybinds, gl3 itself doesn't link against
+        # either, it just spawns them as commands (fuzzel over the
+        # wlr-layer-shell-v1 protocol gl3 implements, see src/gl3.c)
+        packages = deps ++ (with pkgs; [ pkg-config gnumake gdb foot fuzzel bear clang-tools ]);
       };
     };
 }
